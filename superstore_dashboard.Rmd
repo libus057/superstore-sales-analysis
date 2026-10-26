@@ -1,0 +1,218 @@
+---
+title: "Superstore Sales Performance 2023–2026"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(flexdashboard)
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+# The database built by R/01_load_data.R (one folder up from this file)
+db_path <- "../superstore.db"
+if (!file.exists(db_path)) stop("Run R/01_load_data.R first to create superstore.db")
+con <- dbConnect(SQLite(), db_path)
+q   <- function(sql) dbGetQuery(con, sql)
+
+# Same colours as the Tableau dashboard
+col_sales  <- "#4E79A7"   # blue
+col_profit <- "#59A14F"   # green
+col_loss   <- "#E15759"   # red
+
+# KPI numbers (golden rule: SUM first, then divide)
+kpi <- q("
+  SELECT SUM(sales)               AS sales,
+         SUM(profit)              AS profit,
+         SUM(profit) / SUM(sales) AS margin,
+         COUNT(DISTINCT order_id) AS orders
+  FROM orders_enriched")
+
+base_theme <- theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_blank())
+```
+
+Row {data-height=120}
+-----------------------------------------------------------------------
+
+### Total Sales
+
+```{r}
+valueBox(dollar(kpi$sales / 1e6, accuracy = 0.01, suffix = "M"), color = col_sales)
+```
+
+### Total Profit
+
+```{r}
+valueBox(dollar(kpi$profit / 1e3, accuracy = 0.1, suffix = "K"), color = col_profit)
+```
+
+### Profit Margin
+
+```{r}
+valueBox(percent(kpi$margin, accuracy = 0.1), color = "#76B7B2")
+```
+
+### Orders
+
+```{r}
+valueBox(comma(kpi$orders), color = "#9C755F")
+```
+
+Row {data-height=420}
+-----------------------------------------------------------------------
+
+### Sales grew 51% from 2023 to 2026, peaking in the autumn months (blue = Sales, green = Profit)
+
+```{r trend}
+monthly <- q("
+  SELECT order_month, SUM(sales) AS Sales, SUM(profit) AS Profit
+  FROM orders_enriched
+  GROUP BY order_month
+  ORDER BY order_month")
+monthly$order_month <- as.Date(monthly$order_month)
+
+trend_long <- rbind(
+  data.frame(month = monthly$order_month, measure = "Sales",  value = monthly$Sales),
+  data.frame(month = monthly$order_month, measure = "Profit", value = monthly$Profit)
+)
+
+p <- ggplot(trend_long, aes(month, value, colour = measure, group = measure,
+                            text = paste0(format(month, "%b %Y"), "<br>",
+                                          measure, ": ", dollar(value, accuracy = 1)))) +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = c(Sales = col_sales, Profit = col_profit)) +
+  scale_y_continuous(labels = dollar) +
+  labs(x = NULL, y = "Sales & Profit ($)", colour = NULL) +
+  base_theme
+
+ggplotly(p, tooltip = "text") %>% layout(legend = list(orientation = "h", y = 1.1))
+```
+
+### Texas, Ohio, Pennsylvania and Illinois lose the most (US states)
+
+```{r map}
+state_profit <- q("
+  SELECT state_province, SUM(sales) AS sales, SUM(profit) AS profit
+  FROM orders_enriched
+  WHERE country_region = 'United States'
+  GROUP BY state_province")
+state_profit$region <- tolower(state_profit$state_province)
+
+us_map <- map_data("state") %>%
+  left_join(state_profit, by = "region")
+
+p <- ggplot(us_map, aes(long, lat, group = group, fill = profit,
+                        text = paste0(state_province, "<br>Profit: ",
+                                      dollar(profit, accuracy = 1)))) +
+  geom_polygon(colour = "white", linewidth = 0.2) +
+  scale_fill_gradient2(low = col_loss, mid = "#F2F2F2", high = col_profit,
+                       midpoint = 0, labels = dollar, na.value = "grey90") +
+  coord_fixed(1.3) +
+  labs(fill = "Profit") +
+  theme_void()
+
+ggplotly(p, tooltip = "text")
+```
+
+Row {data-height=460}
+-----------------------------------------------------------------------
+
+### Tables, Bookcases and Supplies lose money
+
+```{r subcat}
+subcat <- q("
+  SELECT sub_category, SUM(sales) AS sales, SUM(profit) AS profit,
+         CASE WHEN SUM(profit) >= 0 THEN 'Profit' ELSE 'Loss' END AS profit_or_loss
+  FROM orders_enriched
+  GROUP BY sub_category")
+
+p <- ggplot(subcat, aes(reorder(sub_category, profit), profit, fill = profit_or_loss,
+                        text = paste0(sub_category,
+                                      "<br>Sales: ",  dollar(sales,  accuracy = 1),
+                                      "<br>Profit: ", dollar(profit, accuracy = 1),
+                                      "<br>Margin: ", percent(profit / sales, accuracy = 0.1)))) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c(Profit = col_profit, Loss = col_loss), guide = "none") +
+  scale_y_continuous(labels = dollar) +
+  labs(x = NULL, y = "Profit") +
+  base_theme
+
+ggplotly(p, tooltip = "text") %>% layout(showlegend = FALSE)
+```
+
+### Discounts above 20% turn sales into losses
+
+```{r discount}
+disc <- q("
+  SELECT discount_band, SUM(sales) AS sales, SUM(profit) AS profit
+  FROM orders_enriched
+  GROUP BY discount_band")
+
+disc$band <- factor(disc$discount_band,
+                    levels = c("None", "Low (1-20%)", "Medium (21-40%)", "High (41-80%)"),
+                    labels = c("None", "1-20%", "21-40%", "41-80%"))
+disc$colour <- ifelse(disc$profit >= 0, "Profit", "Loss")
+
+p <- ggplot(disc, aes(band, profit, fill = colour,
+                      text = paste0(band, "<br>Profit: ", dollar(profit, accuracy = 1),
+                                    "<br>Margin: ", percent(profit / sales, accuracy = 0.1)))) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  geom_text(aes(label = dollar(profit, accuracy = 1),
+                y = ifelse(profit >= 0, profit + 25000, profit - 25000)), size = 3.2) +
+  scale_fill_manual(values = c(Profit = col_profit, Loss = col_loss), guide = "none") +
+  scale_y_continuous(labels = dollar) +
+  labs(x = "Discount", y = NULL) +
+  base_theme
+
+ggplotly(p, tooltip = "text") %>% layout(showlegend = FALSE)
+```
+
+### Central Consumers & South Home Office are weakest (green = above 12.6% avg, red = below)
+
+```{r heatmap}
+heat <- q("
+  SELECT region, segment, 100.0 * SUM(profit) / SUM(sales) AS margin_pct
+  FROM orders_enriched
+  GROUP BY region, segment")
+heat$region <- factor(heat$region, levels = rev(c("Central", "East", "South", "West")))
+
+p <- ggplot(heat, aes(segment, region, fill = margin_pct,
+                      text = paste0(region, " · ", segment, "<br>Margin: ",
+                                    round(margin_pct, 1), "%"))) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = paste0(round(margin_pct, 1), "%")), size = 4) +
+  scale_fill_gradient2(low = col_loss, mid = "#F2F2F2", high = col_profit,
+                       midpoint = 12.6, guide = "none") +
+  labs(x = NULL, y = NULL) +
+  base_theme +
+  theme(panel.grid = element_blank())
+
+ggplotly(p, tooltip = "text")
+```
+
+Row {data-height=110}
+-----------------------------------------------------------------------
+
+### Key insight
+
+- **Discounts above 20% lose money:** −\$136K in total; the 41–80% band loses \$77 for every \$100 sold.
+- **Texas sells everything at a discount** (average 37% vs 7% in California) and is the biggest loss-making state.
+- **Recommendation:** cap discounts at 20% and review pricing of Tables, Bookcases and Machines.
+- Data: Sample – Superstore · Built with SQL (SQLite) and R (flexdashboard, ggplot2, plotly).
+
+```{r cleanup, include=FALSE}
+dbDisconnect(con)
+```
